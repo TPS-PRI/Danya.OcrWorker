@@ -24,11 +24,20 @@ try
     // identity (Kerberos/NTLM) on every request. Windows Task Scheduler runs this exe under a
     // dedicated AD service account, so that identity IS the account - Shield checks it's exactly
     // the expected one (Shield:AllowedServiceAccount) instead of an X-Internal-Api-Key header.
+    //
+    // Timeout: runNightlyOcr runs the whole batch synchronously inside the request - the default
+    // 100s HttpClient timeout would abort a real-sized batch partway through (Shield sees the
+    // client disconnect via HttpContext.RequestAborted and stops mid-run). 30 minutes covers a
+    // BatchLimit=100 batch even at the slower end of observed per-invoice extraction time
+    // (~3-8.4s seen locally; 100 x 8.4s ~= 14min, so 15min was too tight a margin - see code
+    // review discussion). Keep in sync with Shield's web.config requestTimeout, or IIS/ANCM will
+    // cut the request at its own 130s default first.
     builder.Services.AddHttpClient("Shield")
         .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
         {
             UseDefaultCredentials = true
-        });
+        })
+        .ConfigureHttpClient(client => client.Timeout = TimeSpan.FromMinutes(30));
 
     builder.Services.AddSingleton<OcrRunner>();
 
