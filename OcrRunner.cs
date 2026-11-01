@@ -34,11 +34,11 @@ namespace Danya.OcrWorker
     /// </summary>
     public class OcrRunner
     {
-        private readonly IHttpClientFactory _httpClientFactory;
+        private readonly System.Net.Http.IHttpClientFactory _httpClientFactory;
         private readonly IConfiguration _config;
         private readonly ILogger<OcrRunner> _logger;
 
-        public OcrRunner(IHttpClientFactory httpClientFactory, IConfiguration config, ILogger<OcrRunner> logger)
+        public OcrRunner(System.Net.Http.IHttpClientFactory httpClientFactory, IConfiguration config, ILogger<OcrRunner> logger)
         {
             _httpClientFactory = httpClientFactory;
             _config = config;
