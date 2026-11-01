@@ -20,10 +20,7 @@ try
     builder.Logging.SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Trace);
     builder.Logging.AddNLog();
 
-    // No custom header, no secret to store or rotate: this client sends the process's own Windows
-    // identity (Kerberos/NTLM) on every request. Windows Task Scheduler runs this exe under a
-    // dedicated AD service account, so that identity IS the account - Shield checks it's exactly
-    // the expected one (Shield:AllowedServiceAccount) instead of an X-Internal-Api-Key header.
+    // Authentication is a JWT from Shield's api/users/loginApi, sent per request (see OcrRunner).
     //
     // Timeout: runNightlyOcr runs the whole batch synchronously inside the request - the default
     // 100s HttpClient timeout would abort a real-sized batch partway through (Shield sees the
@@ -33,10 +30,6 @@ try
     // review discussion). Keep in sync with Shield's web.config requestTimeout, or IIS/ANCM will
     // cut the request at its own 130s default first.
     builder.Services.AddHttpClient("Shield")
-        .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
-        {
-            UseDefaultCredentials = true
-        })
         .ConfigureHttpClient(client => client.Timeout = TimeSpan.FromMinutes(30));
 
     builder.Services.AddSingleton<OcrRunner>();
