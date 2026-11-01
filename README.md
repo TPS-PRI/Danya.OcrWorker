@@ -7,20 +7,23 @@ pass and log what came back.
 
 ## What it does
 
-1. Sends a single `POST` to `{Shield:BaseUrl}/api/ocr/internal/runNightlyOcr`.
-2. Authenticates via **Windows Integrated Auth** (Kerberos/NTLM) — the
-   process's own Windows identity, sent automatically. No API key, no
-   secret to manage or rotate.
+1. Logs in: `POST {Shield:BaseUrl}/api/users/loginApi` with
+   `Shield:LoginName` / `Shield:UserPassword` / `Shield:UserVerify`, and
+   gets a JWT back.
+2. Sends a single `POST` to `{Shield:BaseUrl}/api/ocr/internal/runNightlyOcr`
+   with `Authorization: Bearer <JWT>`.
 3. Shield runs one full OCR pass in-process (find candidates → resolve
    PDF → extract via Gemini → save back to `Danya.Server`) and returns a
    JSON summary.
-4. Logs `scanned` / `saved` / `skipped` / `failed` / `attentionCount`,
+4. Logs out (`POST /api/users/logout`), so the session ends on
+   `Danya.Server` right away instead of staying valid for a day.
+5. Logs `scanned` / `saved` / `skipped` / `failed` / `attentionCount`,
    and exits with:
    - **0** — Shield ran (even with some per-invoice failures — that's
      normal, and Shield's own problem to retry).
-   - **1** — the trigger call itself could not be completed (Shield
-     unreachable, auth rejected, timeout, etc.), so Task Scheduler can
-     flag the run as failed.
+   - **1** — the login or the trigger call itself could not be completed
+     (Shield unreachable, wrong credentials, timeout, etc.), so Task
+     Scheduler can flag the run as failed.
 
 The Worker never touches invoices, PDFs, or Oracle directly — all of
 that logic lives in `Danya.Server.Shield`.
@@ -29,8 +32,8 @@ that logic lives in `Danya.Server.Shield`.
 
 | File | Purpose |
 |---|---|
-| `Program.cs` | Host bootstrap, NLog setup, registers the `"Shield"` `HttpClient` with `UseDefaultCredentials = true` |
-| `OcrRunner.cs` | The actual trigger call + result logging |
+| `Program.cs` | Host bootstrap, NLog setup, registers the `"Shield"` `HttpClient` |
+| `OcrRunner.cs` | Login, the trigger call + result logging, logout |
 | `appsettings.json` / `appsettings.Development.json` | Config (see below) |
 | `nlog.config` | Logging configuration |
 
@@ -39,10 +42,17 @@ that logic lives in `Danya.Server.Shield`.
 ```json
 {
   "Shield": {
-    "BaseUrl": "https://<Danya.Server.Shield's real address>"
+    "BaseUrl": "https://<Danya.Server.Shield's real address>",
+    "LoginName": "<loginApi user>",
+    "UserPassword": "<its password>",
+    "UserVerify": "<its 8-10 digit tax number>"
   }
 }
 ```
+
+The password is a secret: keep it out of git (environment variables
+`Shield__UserPassword` etc., or an `appsettings.json` that is only on the
+server).
 
 `Shield:BaseUrl` must point at a real, reachable `Danya.Server.Shield`
 instance — not `localhost`, in any environment where the two aren't on
@@ -61,21 +71,11 @@ the intended behavior, not a bug.
 
 ## Deployment checklist
 
-- [ ] **Task Scheduler** — create the task on the target server, under a
-  dedicated **AD service account** (e.g. `DOMAIN\svc-ocrworker`), with
+- [ ] **Task Scheduler** — create the task on the target server, with
   **"Run whether user is logged on or not"** checked.
-- [ ] That exact same account must also be:
-  - Set as `Shield:AllowedServiceAccount` in `Danya.Server.Shield`'s
-    `appsettings.json`.
-  - Added to the allow-list in `Danya.Server.Shield`'s `web.config`
-    (`<location path="api/ocr/internal">`).
-  - All three (Task Scheduler, `appsettings.json`, `web.config`) must
-    match **exactly**, including domain.
 - [ ] `Shield:BaseUrl` here points at the real deployed Shield address.
-- [ ] Both machines (this Worker's host and Shield's host) are joined to
-  the same AD domain — Windows Integrated Auth requires it in
-  production (local/dev testing falls back to NTLM under your own
-  Windows login, which works without a domain).
+- [ ] `Shield:LoginName` / `Shield:UserPassword` / `Shield:UserVerify` are
+  set to a real `loginApi` user.
 
 ## Logging
 
