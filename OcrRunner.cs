@@ -7,25 +7,35 @@ using System.Text;
 
 namespace Danya.OcrWorker
 {
-    /// <summary>Mirrors Shield's NightlyOcrRunResult - the JSON body internal/runNightlyOcr returns.</summary>
+    /// <summary>
+    /// Mirrors Shield's NightlyOcrRunResult / NightlyShippingCertOcrRunResult - the JSON body both
+    /// trigger endpoints return. Suspicious and Deferred are only sent by the shipping-cert run.
+    /// </summary>
     public class NightlyOcrRunResult
     {
         public bool Enabled { get; set; } = true;
         public string? RunId { get; set; }
         public int Scanned { get; set; }
         public int Saved { get; set; }
+        public int Suspicious { get; set; }
         public int Skipped { get; set; }
         public int Failed { get; set; }
+        public int Deferred { get; set; }
         public int AttentionCount { get; set; }
     }
+
+    /// <summary>One nightly job on Shield: a name for --job and the log, and its trigger endpoint.</summary>
+    public record NightlyJob(string Name, string Path, string ItemName);
 
     /// <summary>
     /// Windows Task Scheduler runs this exe once per scheduled slot (daily, typically) - it owns
     /// the schedule; this class does not loop or sleep.
     ///
-    /// Deliberately "dumb": it logs in, makes one HTTP call to Shield's internal/runNightlyOcr,
-    /// which triggers one full pass in-process there (find candidates, resolve+extract, save
-    /// back to Danya.Server), and logs out. The Worker does not know about invoices, PDFs, or
+    /// Deliberately "dumb": it logs in, makes one HTTP call per nightly job to Shield, each of
+    /// which triggers one full pass in-process there (find candidates, resolve+check, save back
+    /// to Danya.Server), and logs out. Jobs (see Jobs below):
+    ///   - invoices      -> internal/runNightlyOcr              (invoice OCR)
+    ///   - shippingCerts -> internal/runNightlyShippingCertOcr  (missing stamp / handwriting check) The Worker does not know about invoices, PDFs, or
     /// Danya.Server; it only knows how to wake Shield up and log what came back. See
     /// Danya.Server.Shield/CLAUDE.md "Nightly OCR Pipeline" for the wider design.
     ///
@@ -34,6 +44,12 @@ namespace Danya.OcrWorker
     /// </summary>
     public class OcrRunner
     {
+        public static readonly IReadOnlyList<NightlyJob> Jobs = new[]
+        {
+            new NightlyJob("invoices", "/api/ocr/internal/runNightlyOcr", "invoice"),
+            new NightlyJob("shippingCerts", "/api/ocr/internal/runNightlyShippingCertOcr", "shipping certificate file"),
+        };
+
         private readonly System.Net.Http.IHttpClientFactory _httpClientFactory;
         private readonly IConfiguration _config;
         private readonly ILogger<OcrRunner> _logger;
@@ -45,11 +61,12 @@ namespace Danya.OcrWorker
             _logger = logger;
         }
 
-        /// <summary>Triggers one nightly OCR pass on Shield. Returns a process exit code: 0 if
-        /// Shield ran (even with some per-invoice failures - that's normal and Shield's own
-        /// problem to retry), 1 if the login or the trigger call itself could not be completed,
-        /// so Task Scheduler can flag the run as failed.</summary>
-        public async Task<int> RunOnceAsync(CancellationToken cancellationToken)
+        /// <summary>Triggers one pass of each given job on Shield, in order, with one login.
+        /// Returns a process exit code: 0 if Shield ran every job (even with some per-item
+        /// failures - that's normal and Shield's own problem to retry), 1 if the login or any
+        /// trigger call could not be completed, so Task Scheduler can flag the run as failed. A
+        /// failed job does not stop the next one.</summary>
+        public async Task<int> RunOnceAsync(IReadOnlyList<NightlyJob> jobs, CancellationToken cancellationToken)
         {
             var baseUrl = _config["Shield:BaseUrl"];
 
@@ -68,7 +85,13 @@ namespace Danya.OcrWorker
 
             try
             {
-                return await RunNightlyOcrAsync(client, baseUrl, token, cancellationToken);
+                var exitCode = 0;
+                foreach (var job in jobs)
+                {
+                    if (await RunJobAsync(client, baseUrl, token, job, cancellationToken) != 0)
+                        exitCode = 1;
+                }
+                return exitCode;
             }
             finally
             {
@@ -119,11 +142,13 @@ namespace Danya.OcrWorker
             }
         }
 
-        private async Task<int> RunNightlyOcrAsync(HttpClient client, string baseUrl, string token, CancellationToken cancellationToken)
+        private async Task<int> RunJobAsync(HttpClient client, string baseUrl, string token, NightlyJob job, CancellationToken cancellationToken)
         {
             try
             {
-                using var request = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/api/ocr/internal/runNightlyOcr");
+                _logger.LogInformation("[{Job}] triggering {Path}", job.Name, job.Path);
+
+                using var request = new HttpRequestMessage(HttpMethod.Post, baseUrl + job.Path);
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
                 using var response = await client.SendAsync(request, cancellationToken);
@@ -131,7 +156,8 @@ namespace Danya.OcrWorker
 
                 if (!response.IsSuccessStatusCode)
                 {
-                    _logger.LogError("internal/runNightlyOcr returned {Status}: {Body}", (int)response.StatusCode, body);
+                    // 409 = the previous run of this job is still going on Shield.
+                    _logger.LogError("[{Job}] {Path} returned {Status}: {Body}", job.Name, job.Path, (int)response.StatusCode, body);
                     return 1;
                 }
 
@@ -139,31 +165,31 @@ namespace Danya.OcrWorker
 
                 if (result == null)
                 {
-                    _logger.LogError("internal/runNightlyOcr returned an unparsable body: {Body}", body);
+                    _logger.LogError("[{Job}] {Path} returned an unparsable body: {Body}", job.Name, job.Path, body);
                     return 1;
                 }
 
                 if (!result.Enabled)
                 {
-                    _logger.LogInformation("Shield reports Ocr:Enabled = false - nothing ran");
+                    _logger.LogInformation("[{Job}] Shield reports this job is disabled - nothing ran", job.Name);
                     return 0;
                 }
 
                 _logger.LogInformation(
-                    "[ocr:{RunId}] scanned:{Scanned} saved:{Saved} skipped:{Skipped} failed:{Failed}",
-                    result.RunId, result.Scanned, result.Saved, result.Skipped, result.Failed);
+                    "[{Job}:{RunId}] scanned:{Scanned} saved:{Saved} suspicious:{Suspicious} skipped:{Skipped} failed:{Failed} deferred:{Deferred}",
+                    job.Name, result.RunId, result.Scanned, result.Saved, result.Suspicious, result.Skipped, result.Failed, result.Deferred);
 
                 if (result.AttentionCount > 0)
                 {
-                    _logger.LogWarning("[ocr:{RunId}] {Count} invoice(s) need manual attention on Shield",
-                        result.RunId, result.AttentionCount);
+                    _logger.LogWarning("[{Job}:{RunId}] {Count} {Item}(s) need manual attention on Shield",
+                        job.Name, result.RunId, result.AttentionCount, job.ItemName);
                 }
 
                 return 0;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "internal/runNightlyOcr call failed");
+                _logger.LogError(ex, "[{Job}] {Path} call failed", job.Name, job.Path);
                 return 1;
             }
         }

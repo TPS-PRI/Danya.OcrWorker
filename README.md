@@ -2,28 +2,36 @@
 
 Small .NET 8 console app, triggered once per scheduled slot (daily) by
 **Windows Task Scheduler**. It does not know about invoices, PDFs, or
-Oracle — its only job is to wake up `Danya.Server.Shield`'s nightly OCR
-pass and log what came back.
+Oracle — its only job is to wake up `Danya.Server.Shield`'s nightly jobs
+and log what came back:
+
+| Job (`--job`) | Shield endpoint | What Shield does |
+|---|---|---|
+| `invoices` | `POST /api/ocr/internal/runNightlyOcr` | Invoice OCR (`TPS_B2B_GET_OCR` → Gemini → `TPS_B2B_SET_IV_OCR`) |
+| `shippingCerts` | `POST /api/ocr/internal/runNightlyShippingCertOcr` | Shipping-certificate check for a missing stamp / handwriting (`TPS_B2B_GET_OCR_DOC` → model → `TPS_B2B_SET_OCR_DOC`) |
+
+With no arguments it runs both, in that order, with one login. To run only
+some: `Danya.OcrWorker.exe --job shippingCerts` (repeatable).
 
 ## What it does
 
 1. Logs in: `POST {Shield:BaseUrl}/api/users/loginApi` with
    `Shield:LoginName` / `Shield:UserPassword` / `Shield:UserVerify`, and
    gets a JWT back.
-2. Sends a single `POST` to `{Shield:BaseUrl}/api/ocr/internal/runNightlyOcr`
-   with `Authorization: Bearer <JWT>`.
-3. Shield runs one full OCR pass in-process (find candidates → resolve
-   PDF → extract via Gemini → save back to `Danya.Server`) and returns a
-   JSON summary.
+2. For each job, sends one `POST` to its Shield endpoint with
+   `Authorization: Bearer <JWT>`.
+3. Shield runs one full pass in-process (find candidates → download the
+   file → model → save back to `Danya.Server`) and returns a JSON summary.
+   A failed job does not stop the next one.
 4. Logs out (`POST /api/users/logout`), so the session ends on
    `Danya.Server` right away instead of staying valid for a day.
 5. Logs `scanned` / `saved` / `skipped` / `failed` / `attentionCount`,
    and exits with:
    - **0** — Shield ran (even with some per-invoice failures — that's
      normal, and Shield's own problem to retry).
-   - **1** — the login or the trigger call itself could not be completed
-     (Shield unreachable, wrong credentials, timeout, etc.), so Task
-     Scheduler can flag the run as failed.
+   - **1** — the login or any trigger call could not be completed
+     (Shield unreachable, wrong credentials, timeout, a job still running
+     from before (409), etc.), so Task Scheduler can flag the run as failed.
 
 The Worker never touches invoices, PDFs, or Oracle directly — all of
 that logic lives in `Danya.Server.Shield`.
