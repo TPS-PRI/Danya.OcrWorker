@@ -42,8 +42,22 @@ try
     // wondering why nothing ran.
     var runner = host.Services.GetRequiredService<OcrRunner>();
 
-    // One call, then exit - Windows Task Scheduler owns the schedule now, not this process.
-    return await runner.RunOnceAsync(CancellationToken.None);
+    // Which nightly jobs to trigger: all of them by default, or only those named with
+    // --job (repeatable), e.g. "--job shippingCerts" - so each can get its own Task Scheduler task.
+    var jobNames = args.Where((_, i) => i > 0 && args[i - 1] == "--job").ToList();
+    var jobs = jobNames.Count == 0
+        ? OcrRunner.Jobs
+        : OcrRunner.Jobs.Where(j => jobNames.Contains(j.Name, StringComparer.OrdinalIgnoreCase)).ToList();
+
+    var unknown = jobNames.Where(n => !OcrRunner.Jobs.Any(j => j.Name.Equals(n, StringComparison.OrdinalIgnoreCase))).ToList();
+    if (unknown.Count > 0)
+    {
+        nlogLogger.Error("Unknown --job {Jobs}. Known jobs: {Known}", string.Join(",", unknown), string.Join(",", OcrRunner.Jobs.Select(j => j.Name)));
+        return 1;
+    }
+
+    // One call per job, then exit - Windows Task Scheduler owns the schedule now, not this process.
+    return await runner.RunOnceAsync(jobs, CancellationToken.None);
 }
 catch (Exception exception)
 {
